@@ -15,6 +15,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!supabase/lib/
 lib64/
 parts/
 sdist/
