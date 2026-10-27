@@ -8,9 +8,17 @@ project (database + Storage files) and put one back:
 | [`backup-supabase.sh`](backup-supabase.sh) | Dumps roles, schema and data, downloads every Storage object, writes checksums. |
 | [`restore-supabase.sh`](restore-supabase.sh) | Reloads a snapshot's data and Storage objects into a project. **Destructive.** |
 
-The project is always given on the command line (`--ref`, `--name`, `<env>`), so
-the same scripts serve every project on the machine. Each project can later
-add a thin wrapper that fills those in (see [Project wrappers](#project-wrappers)).
+Day to day you name the project and environment and nothing else:
+
+```bash
+supabase/backup-supabase.sh zhiming test
+supabase/restore-supabase.sh --rehearse zhiming test latest
+```
+
+The ref and backup location come from [`projects.ini`](projects.ini). The
+access token comes from `tokens.ini`, which is not in git. Both files sit next
+to the scripts. Everything can also be given on the command line instead (the
+[long form](#long-form)).
 
 ## Requirements
 
@@ -18,59 +26,88 @@ add a thin wrapper that fills those in (see [Project wrappers](#project-wrappers
 - `pg_dump` and `psql`: `brew install libpq`. It is keg-only; the scripts find
   it under `/opt/homebrew/opt/libpq/bin` themselves.
 - `jq`
-- A personal access token (below)
+- A personal access token per Supabase account (below)
 
 No Docker, no database password, and never `supabase login`.
 
-## Access token
+## projects.ini
 
-The CLI's stored login (`supabase login`, kept in the macOS keychain) is
-global. With projects on more than one Supabase account it can silently be the
-wrong account, and running `supabase login` for one project overwrites another
-project's login. So the scripts never use it and never run it. They take a
-token from:
+Refs and backup locations. No secrets, so it is committed:
 
-1. `--token-file <file>`, if given, or else
-2. `$SUPABASE_ACCESS_TOKEN`.
+```ini
+[global]
+backup_root = ~/supabase-backups/db-backups
 
-With neither, they stop. Create the token while signed in to the account
-that owns the project, at <https://supabase.com/dashboard/account/tokens>, and
-keep it in a file only you can read:
+[zhiming]
+test = stfwyybgesmctalxmezl
+prod = ydqcnjernsmdqhnulhbt
 
-```bash
-echo 'SUPABASE_ACCESS_TOKEN=sbp_...' > .env.local && chmod 600 .env.local
+[dating]
+backup_dir = ~/Library/CloudStorage/OneDrive-Personal/.../we-dating-app/db-backups
+test = ...
+prod = ...
 ```
 
-The file can be dotenv-style (other keys are ignored; `export` and quotes are
-fine) or hold just the token. It is parsed, never sourced. The scripts warn if
-other users can read it.
+| Setting | Meaning |
+| --- | --- |
+| `[global] backup_root` | Parent of all project folders: snapshots go to `<root>/<project>/<env>/`. |
+| `[<project>] <env> = <ref>` | One line per environment. `<env>` is the label you type, e.g. `test` or `prod`. |
+| `[<project>] backup_dir` | This project's own folder: snapshots go to `<backup_dir>/<env>/`, ignoring `backup_root`. |
+| `[<project>] account` | The `tokens.ini` section holding the token. Defaults to the project's name; set it when two projects share an account. |
 
-Before doing anything else, the scripts run `supabase projects list` with the
-token and refuse unless `--ref` is among the projects that account can see.
-The error lists what the token *can* see, so a token from the wrong account is
-easy to spot. A paused project is refused as well.
+Paths are absolute or start with `~/`. The file is checked as a whole on every
+run, so a mistake anywhere stops the scripts instead of quietly falling back to
+a default. A misspelled `[global]` section shows up as a project with a
+`backup_root` setting, which is an error. So is any project setting that isn't
+`account`, `backup_dir` or a valid 20-letter ref. A ref is not a secret (it is
+in every app build), but keep the file in a private repo all the same.
+
+## tokens.ini
+
+The short form's access tokens, one section per Supabase **account**:
+
+```ini
+[zhiming]
+token = sbp_...
+```
+
+Set it up from the template:
+
+```bash
+cd supabase && cp tokens.example.ini tokens.ini && chmod 600 tokens.ini
+```
+
+Create each token at <https://supabase.com/dashboard/account/tokens> while
+signed in to the account that owns the projects. A token is account-wide: it
+can manage **every** project in that account, prod included. It must never
+reach git, private repo or not. `tokens.ini` is in `.gitignore`. Before
+reading it, the scripts also refuse if:
+
+- anyone but you can read it (`chmod 600`),
+- git tracks it (it was force-added or committed: remove it and rotate every
+  token in it), or
+- git would not ignore it (the ignore rule was lost).
+
+Why not `supabase login`? The CLI's stored login (in the macOS keychain) is
+global. With projects on more than one account it can silently be the wrong
+one, and logging in for one project overwrites another's login. So the scripts
+never use it and never run it.
+
+Whatever the token's source, the scripts first run `supabase projects list`
+with it and refuse unless the target ref is among the projects that account
+can see. The error lists what the token *can* see, so a token from the wrong
+account is easy to spot. A paused project is refused as well.
 
 ## Backup
 
 ```bash
-supabase/backup-supabase.sh --ref <project-ref> --name <project> [--token-file <file>] <env>
+supabase/backup-supabase.sh [--token-file <file>] [--backup-root <dir>] <project> <env>
 ```
-
-For example, the Zhiming test project:
-
-```bash
-supabase/backup-supabase.sh --ref stfwyybgesmctalxmezl --name zhiming --token-file ~/development/suanming-app/.env.local test
-```
-
-- `--ref` is the 20-letter project ref (the subdomain in `SUPABASE_URL`).
-- `--name` is your name for the project and `<env>` the environment label.
-  Together they pick the snapshot directory. Both may use only letters,
-  digits, `.`, `_` and `-`.
 
 Each run writes a new snapshot:
 
 ```
-<backup root>/db-backups/<name>/<env>/
+<backup dir>/<env>/
 ├── 20261025T192358Z/
 │   ├── roles.sql.gz      cluster roles
 │   ├── schema.sql.gz     DDL for all non-internal schemas
@@ -81,37 +118,73 @@ Each run writes a new snapshot:
 └── latest -> 20261025T192358Z
 ```
 
-The backup root is `--backup-root <dir>`, else `$SUPABASE_BACKUP_ROOT`, else
-`~/supabase-backups`. The scripts deliberately ignore `$BACKUP_ROOT`. That
-name is generic, and one project exporting it in a shell profile (the dating
-app's `~/.zshrc` does) would pull every other project's snapshots into its
-folder.
+`<backup dir>` is the first of these that applies:
 
-Environment knobs: `KEEP` (snapshots kept per `<name>/<env>`, default 30) and
-`BULK_THRESHOLD` (past this many new objects in a bucket, download the whole
-bucket instead of one by one; default 50).
+| Source | `<backup dir>` |
+| --- | --- |
+| `--backup-root <dir>` | `<dir>/<project>` |
+| `projects.ini [<project>] backup_dir` | that directory |
+| `projects.ini [global] backup_root` | `<root>/<project>` |
+| otherwise | `~/supabase-backups/db-backups/<project>` |
+
+The scripts deliberately ignore `$BACKUP_ROOT`. That name is generic, and one
+project exporting it in a shell profile (the dating app's `~/.zshrc` does)
+would pull every other project's snapshots into its folder.
+
+Environment knobs: `KEEP` (snapshots kept per `<project>/<env>`, default 30)
+and `BULK_THRESHOLD` (past this many new objects in a bucket, download the
+whole bucket instead of one by one; default 50).
 
 Storage downloads are incremental. Objects whose size and `updated_at` match
 the previous snapshot are hard-linked from it, so every snapshot is still a
 complete standalone copy while unchanged files share disk.
 
-Only a finished run leaves a snapshot behind. A failure removes the
-`.partial` directory. Snapshots are written owner-only (`umask 077`), because
-`data.sql` holds password hashes, emails and user data: keep the root off
-shared drives and out of git.
+Each snapshot is built in a private staging directory under `$TMPDIR` and
+moved into place only when complete, so a failed run leaves nothing behind
+(see [Cloud-synced backup folders](#cloud-synced-backup-folders)). `latest` is a
+convenience symlink; on the command line, `latest` means the newest snapshot
+directory, whatever the symlink says. Snapshots are written owner-only (`umask 077`), because
+`data.sql` holds password hashes, emails and user data: keep the backup
+location out of git, and think twice before pointing it at a shared drive.
 
 Not backed up: edge function secrets (write-only in Supabase; keep them in a
 password manager) and dashboard settings (auth providers, SMTP, bucket config).
 
+## Cloud-synced backup folders
+
+`backup_root` and `backup_dir` can point into OneDrive or iCloud Drive
+(anything under `~/Library/CloudStorage`). macOS runs those folders through
+File Provider, and a long write into one can fail with `Operation timed out`
+while the sync client is busy. So the backup never writes into the folder
+while it dumps. It stages locally and moves the finished snapshot in with one
+rename (instant: `$TMPDIR` is on the same volume). If even that move fails,
+the complete snapshot stays in the staging directory, and the error prints
+the `mv` command that finishes the job.
+
+Worth knowing when the folder is synced:
+
+- **Symlinks don't survive OneDrive.** `latest` can come back as a plain file.
+  The scripts don't rely on it.
+- **Hard links only save space on this Mac.** OneDrive uploads every
+  snapshot's Storage files in full, so cloud usage grows with `KEEP` × your
+  Storage size.
+- **Keep the folder on the device.** Turn on *Always keep on this device* for
+  it. Otherwise OneDrive may make old snapshots online-only, and a restore (or
+  the next backup reusing their files) has to download them first.
+- **The cloud provider stores your users' data.** Snapshots hold password
+  hashes, emails and user data, and a synced folder uploads them.
+- **Staging needs room for one full snapshot** on the `$TMPDIR` volume. Set
+  `TMPDIR` to stage somewhere else.
+
 ## Restore
 
 ```bash
-supabase/restore-supabase.sh --ref <project-ref> --name <project> [options] <env> <snapshot>
+supabase/restore-supabase.sh [options] <project> <env> <snapshot>
 ```
 
 `<snapshot>` is `latest`, a timestamp, or a path to a snapshot directory.
-Names resolve under `<backup root>/db-backups/<name>/<source>/`. `<source>`
-is `--source <env>` and defaults to `<env>`.
+Names resolve under `<backup dir>/<source>/`, where `<source>` is `--source
+<env>` and defaults to `<env>`.
 
 | Option | |
 | --- | --- |
@@ -119,15 +192,15 @@ is `--source <env>` and defaults to `<env>`.
 | `--source <env>` | Read the snapshot from another environment, e.g. restore prod's backup into test. |
 | `--skip-db` / `--skip-storage` | Restore only one half. |
 | `--no-prune-storage` | Keep target objects that are not in the snapshot (default: delete them). |
-| `--backup-root <dir>` | As for backup. |
+| `--token-file <file>`, `--backup-root <dir>` | As for backup. |
 | `--yes` | Skip the confirmation prompt, for unattended runs. |
 
 ```bash
 # Prove a snapshot restores cleanly, changing nothing:
-supabase/restore-supabase.sh --ref stfwyybgesmctalxmezl --name zhiming --token-file ~/development/suanming-app/.env.local --rehearse test latest
+supabase/restore-supabase.sh --rehearse zhiming test latest
 
 # Check prod's latest backup by restoring it into the test project:
-supabase/restore-supabase.sh --ref <test-ref> --name zhiming --token-file <file> --source prod test latest
+supabase/restore-supabase.sh --source prod zhiming test latest
 ```
 
 **This overwrites data.** Every table in the snapshot is truncated and
@@ -155,14 +228,42 @@ How the restore works:
   them is in the `storage` schema the script refuses, since that would orphan
   the stored files. Tables unrelated to the snapshot are left alone.
 
+## Long form
+
+Every setting can be given on the command line instead, for a project that is
+not in `projects.ini` or when you want to override it:
+
+```bash
+supabase/backup-supabase.sh --ref <project-ref> --name <project> [--token-file <file>] [--backup-root <dir>] <env>
+supabase/restore-supabase.sh --ref <project-ref> --name <project> [options] <env> <snapshot>
+```
+
+- `--ref` is the 20-letter project ref (the subdomain in `SUPABASE_URL`).
+- `--name` is your name for the project. It picks the backup location just
+  as `<project>` does in the short form.
+- The token comes from `--token-file`, else `$SUPABASE_ACCESS_TOKEN`. The long
+  form does not read `tokens.ini`.
+- If `projects.ini` lists `--name`/`<env>` with a different ref, the scripts
+  refuse: one of the two is wrong.
+
+The short form takes `--token-file` too, and then uses it instead of
+`tokens.ini`. It ignores `$SUPABASE_ACCESS_TOKEN`: a token exported for one
+account would otherwise override `tokens.ini` for every project. A token file
+can be dotenv-style (`SUPABASE_ACCESS_TOKEN=sbp_...`; other keys are ignored,
+`export` and quotes are fine) or hold just the token. It is parsed, never
+sourced.
+
 ## Safety checks
 
 | Check | Where |
 | --- | --- |
-| Token only from `--token-file` / `SUPABASE_ACCESS_TOKEN`; never `supabase login` or the stored login | both |
-| Token's account must see `--ref`, and the project must be active | both, before anything else |
+| `projects.ini` and `tokens.ini` parsed strictly; any unknown setting or malformed ref is an error | both |
+| Long-form `--ref` must match `projects.ini` when it lists that project/env | both |
+| Token only from `--token-file`, `tokens.ini` or `SUPABASE_ACCESS_TOKEN`; never `supabase login` or the stored login | both |
+| `tokens.ini` must be `chmod 600`, untracked and git-ignored | both |
+| Token's account must see the ref, and the project must be active | both, before anything else |
 | CLI runs against a private link in a fresh temp directory, deleted on exit | both |
-| `<name>/<env>` is tied to the ref of its latest snapshot; a different `--ref` is refused | both |
+| `<project>/<env>` is tied to the ref of its latest snapshot; a different ref is refused | both |
 | `auth.users` must be in the dump; every object must be on disk where the manifest says | backup |
 | Snapshot checksums must verify | restore |
 | Missing tables or buckets on the target → refuse | restore |
@@ -177,27 +278,9 @@ directory and points every CLI call there with `--workdir`. So a deploy or a
 second backup running at the same time cannot repoint it, and running a
 backup does not change what your project checkout is linked to.
 
-## Project wrappers
+## Old snapshots
 
-A project wrapper only needs to supply the arguments. For example, a
-`scripts/backup-supabase.sh` in a project that keeps its URL in
-`dart-defines.<env>.json` could look like this. It is a sketch for later; no
-wrapper has been added to any project yet:
-
-```bash
-#!/bin/bash
-set -euo pipefail
-cd "$(dirname "$0")/.."
-ENV="${1:?usage: $0 test|prod}"
-REF=$(sed -n 's|.*"SUPABASE_URL": *"https://\([a-z0-9]*\)\.supabase\.co".*|\1|p' "dart-defines.$ENV.json")
-exec ~/development/scripts-tools/supabase/backup-supabase.sh \
-    --ref "$REF" --name zhiming --token-file .env.local "$ENV"
-```
-
-A wrapper is also the place for project-specific guards, such as a list of
-refs from another account that the project must never touch, and for a
-`--backup-root` if that project's snapshots belong somewhere else.
-
-Snapshots from the dating app's old scripts (`<root>/db-backups/<env>/<stamp>/`)
-have the same contents and restore with these scripts by path. To get them
-under the new layout, move `<env>/` to `<name>/<env>/`.
+Snapshots from the dating app's old scripts have the same contents. The
+`[dating]` entry's `backup_dir` points at the folder those scripts wrote to,
+so its `<env>/` series simply continues. Any snapshot can also be restored by
+path.

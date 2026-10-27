@@ -1,19 +1,22 @@
 #!/bin/bash
 # Restore a snapshot produced by backup-supabase.sh into a project.
 #
-#   Usage: restore-supabase.sh --ref <project-ref> --name <project> [options] <env> <snapshot>
+#   Usage: restore-supabase.sh [options] <project> <env> <snapshot>
+#          restore-supabase.sh --ref <project-ref> --name <project> [options] <env> <snapshot>
 #
-#     --ref <ref>           the project to restore INTO
-#     --name <project>      your name for the project, e.g. zhiming
-#     <env>                 environment label of --ref, e.g. test or prod
-#     <snapshot>            latest | <timestamp> — under <backup root>/db-backups/<project>/<source>/
+#     <project> <env>       short form: the project to restore INTO, looked up in
+#                           projects.ini; the token comes from tokens.ini
+#     --ref <ref>           long form: the project to restore INTO
+#     --name <project>      long form: your name for the project, e.g. zhiming
+#     <env>                 environment label of the target, e.g. test or prod
+#     <snapshot>            latest | <timestamp> — under <backup dir>/<source>/
 #                           | <path>             — or a snapshot directory given directly
 #
 #   Options:
-#     --token-file <file>   read the access token from <file> instead of
-#                           $SUPABASE_ACCESS_TOKEN
-#     --backup-root <dir>   where snapshots are (default: $SUPABASE_BACKUP_ROOT,
-#                           else ~/supabase-backups)
+#     --token-file <file>   read the access token from <file>. Without it the short
+#                           form uses tokens.ini, the long form $SUPABASE_ACCESS_TOKEN
+#     --backup-root <dir>   look for snapshots under <dir>/<project>/ instead of
+#                           where projects.ini says (see backup-supabase.sh)
 #     --source <env>        where to read <snapshot> from (default: <env>)
 #     --skip-db             do not touch the database
 #     --skip-storage        do not touch Storage
@@ -26,11 +29,11 @@
 #
 #   Examples:
 #     # Check a snapshot restores cleanly, leaving the project unchanged:
-#     restore-supabase.sh --ref <test-ref> --name zhiming --rehearse test latest
+#     restore-supabase.sh --rehearse zhiming test latest
 #     # Verify prod's latest backup by restoring it into the test project:
-#     restore-supabase.sh --ref <test-ref> --name zhiming --source prod test latest
+#     restore-supabase.sh --source prod zhiming test latest
 #     # Disaster recovery — put prod's latest snapshot back into prod:
-#     restore-supabase.sh --ref <prod-ref> --name zhiming prod latest
+#     restore-supabase.sh zhiming prod latest
 #
 # ============================ THIS IS DESTRUCTIVE ============================
 # The target's data is replaced with the snapshot's. Every table in the dump is
@@ -41,8 +44,9 @@
 # ============================================================================
 #
 # How it works, and its limits:
-#   * The token and the temp-directory link work exactly as in the backup: the
-#     token's account must see --ref, and no project checkout's link is used.
+#   * The target, token and temp-directory link work exactly as in the backup:
+#     the token's account must see the ref, and no project checkout's link is
+#     used.
 #   * Connects with the same short-lived login role the backup uses (obtained
 #     from `supabase db dump --dry-run`), so NO database password is needed. The
 #     role is a member of `postgres`; the restore does `SET ROLE postgres` to
@@ -80,6 +84,7 @@ SKIP_STORAGE=0
 PRUNE_STORAGE=1
 REHEARSE=0
 ASSUME_YES=0
+POS=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -95,25 +100,32 @@ while [ $# -gt 0 ]; do
         --yes|-y)           ASSUME_YES=1; shift;;
         -h|--help)          usage 0;;
         -*)                 echo "Unknown option: $1" >&2; usage 1;;
-        *)
-            if   [ -z "$ENV" ];          then ENV="$1"
-            elif [ -z "$SNAPSHOT_ARG" ]; then SNAPSHOT_ARG="$1"
-            else echo "Unexpected argument: $1" >&2; usage 1
-            fi
-            shift;;
+        *)                  POS+=("$1"); shift;;
     esac
 done
 
-check_target_args
-if [ -z "$SNAPSHOT_ARG" ]; then
-    echo "Missing <snapshot> (e.g. 'latest' or a timestamp or a path)." >&2; usage 1
+if [ -n "$REF" ]; then
+    MODE=long
+    [ -n "$NAME" ] || die "--ref needs --name <project> too (or use the short form: <project> <env> <snapshot>)."
+    [ ${#POS[@]} -eq 2 ] || { echo "With --ref/--name, give <env> <snapshot>." >&2; usage 1; }
+    ENV="${POS[0]}"
+    SNAPSHOT_ARG="${POS[1]}"
+else
+    MODE=short
+    [ -z "$NAME" ] || die "--name goes with --ref. The short form is: $(basename "$0") <project> <env> <snapshot>"
+    [ ${#POS[@]} -eq 3 ] || { echo "Expected <project> <env> <snapshot> (e.g. 'latest' or a timestamp or a path)." >&2; usage 1; }
+    NAME="${POS[0]}"
+    ENV="${POS[1]}"
+    SNAPSHOT_ARG="${POS[2]}"
 fi
+
 if [ "$SKIP_DB" = 1 ] && [ "$SKIP_STORAGE" = 1 ]; then
     echo "Nothing to do: both --skip-db and --skip-storage given." >&2; exit 1
 fi
+resolve_target
+resolve_backup_dir
 SOURCE_ENV="${SOURCE_ENV:-$ENV}"
 check_label --source "$SOURCE_ENV"
-resolve_backups_dir
 
 # ------------------------------------------------------------- preflight --
 
@@ -121,11 +133,14 @@ use_libpq
 require_tools supabase psql jq gzip shasum
 
 # Resolve the snapshot directory. A value containing '/' is a path; otherwise it
-# names a snapshot under <project>/<source>/ (where 'latest' is the symlink).
+# names a snapshot under <backup dir>/<source>/. 'latest' is the newest one
+# there, found by listing: the latest symlink does not survive OneDrive.
 case "$SNAPSHOT_ARG" in
-    */*) SNAP="$SNAPSHOT_ARG";;
-    *)   check_label "<snapshot>" "$SNAPSHOT_ARG"
-         SNAP="$BACKUPS_DIR/$NAME/$SOURCE_ENV/$SNAPSHOT_ARG";;
+    */*)    SNAP="$SNAPSHOT_ARG";;
+    latest) SNAP=$(latest_snapshot "$BACKUP_DIR/$SOURCE_ENV") ||
+                die "No snapshots in $BACKUP_DIR/$SOURCE_ENV.";;
+    *)      check_label "<snapshot>" "$SNAPSHOT_ARG"
+            SNAP="$BACKUP_DIR/$SOURCE_ENV/$SNAPSHOT_ARG";;
 esac
 if [ ! -d "$SNAP" ]; then
     echo "Snapshot directory not found: $SNAP" >&2; exit 1

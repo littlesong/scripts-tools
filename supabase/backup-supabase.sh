@@ -1,23 +1,34 @@
 #!/bin/bash
 # Full local backup of a Supabase project: database dump + Storage objects.
 #
-#   Usage: backup-supabase.sh --ref <project-ref> --name <project> [options] <env>
+#   Usage: backup-supabase.sh [options] <project> <env>
+#          backup-supabase.sh --ref <project-ref> --name <project> [options] <env>
 #
-#     --ref <ref>          the project to back up (20 lowercase letters)
-#     --name <project>     your name for the project, e.g. zhiming
+#     <project> <env>      short form: the ref comes from projects.ini and the
+#                          token from tokens.ini, both next to this script
+#     --ref <ref>          long form: the project to back up (20 lowercase letters)
+#     --name <project>     long form: your name for the project, e.g. zhiming
 #     <env>                environment label, e.g. test or prod
-#     --token-file <file>  read the access token from <file> instead of
-#                          $SUPABASE_ACCESS_TOKEN
-#     --backup-root <dir>  where snapshots go (default: $SUPABASE_BACKUP_ROOT,
-#                          else ~/supabase-backups)
+#     --token-file <file>  read the access token from <file>. Without it the short
+#                          form uses tokens.ini, the long form $SUPABASE_ACCESS_TOKEN
+#     --backup-root <dir>  put snapshots under <dir>/<project>/ instead of where
+#                          projects.ini says
 #     -h, --help
 #
-#   Example:
+#   Examples:
+#     backup-supabase.sh zhiming test
 #     backup-supabase.sh --ref abcdefghijklmnopqrst --name zhiming \
 #         --token-file ~/development/suanming-app/.env.local test
 #
 # Writes a self-contained, timestamped snapshot to
-# <backup root>/db-backups/<project>/<env>/<UTC timestamp>/:
+# <backup dir>/<env>/<UTC timestamp>/. <backup dir> is the first that applies:
+#
+#   --backup-root <dir>                   <dir>/<project>
+#   projects.ini [<project>] backup_dir   that directory
+#   projects.ini [global] backup_root     <root>/<project>
+#   otherwise                             ~/supabase-backups/db-backups/<project>
+#
+# Each snapshot holds:
 #
 #   roles.sql.gz    cluster roles
 #   schema.sql.gz   DDL for all non-internal schemas
@@ -29,8 +40,8 @@
 # Requirements — no Docker, no database password and no `supabase login`:
 #   * supabase CLI
 #   * a personal access token for the account that owns the project, in
-#     SUPABASE_ACCESS_TOKEN or --token-file. Its account must be able to see
-#     --ref, or the script stops before doing anything.
+#     tokens.ini, --token-file or SUPABASE_ACCESS_TOKEN. Its account must be
+#     able to see the project, or the script stops before doing anything.
 #   * pg_dump (brew install libpq); this script finds the keg-only build itself
 #   * jq
 #
@@ -41,7 +52,7 @@
 # without needing Docker or storing the database password anywhere.
 #
 # `supabase storage` has no --project-ref flag; it only acts on a linked
-# project. Each run links --ref in its own temp directory and runs every CLI
+# project. Each run links the ref in its own temp directory and runs every CLI
 # command against that, so it never touches a project checkout's link and
 # nothing else can repoint it mid-run.
 #
@@ -51,6 +62,11 @@
 # Storage downloads are incremental: objects whose size and updated_at are
 # unchanged since the previous snapshot are hard-linked from it rather than
 # re-fetched. Every snapshot directory is still a complete standalone copy.
+#
+# Each snapshot is assembled in a private staging directory under $TMPDIR and
+# moved into the backup folder only when complete, which also keeps the script
+# working when that folder is cloud-synced (OneDrive, iCloud; see README.md).
+# Point TMPDIR elsewhere to stage on another volume.
 #
 # Secrets are deliberately NOT backed up. Edge function secrets are write-only
 # in Supabase and cannot be read back; keep them in a password manager.
@@ -75,6 +91,7 @@ NAME=""
 ENV=""
 TOKEN_FILE=""
 BACKUP_ROOT_OPT=""
+POS=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -84,14 +101,25 @@ while [ $# -gt 0 ]; do
         --backup-root) need_value "$@"; BACKUP_ROOT_OPT="$2"; shift 2;;
         -h|--help)     usage 0;;
         -*)            echo "Unknown option: $1" >&2; usage 1;;
-        *)
-            [ -z "$ENV" ] || { echo "Unexpected argument: $1" >&2; usage 1; }
-            ENV="$1"; shift;;
+        *)             POS+=("$1"); shift;;
     esac
 done
 
-check_target_args
-resolve_backups_dir
+if [ -n "$REF" ]; then
+    MODE=long
+    [ -n "$NAME" ] || die "--ref needs --name <project> too (or use the short form: <project> <env>)."
+    [ ${#POS[@]} -eq 1 ] || { echo "With --ref/--name, give just <env>." >&2; usage 1; }
+    ENV="${POS[0]}"
+else
+    MODE=short
+    [ -z "$NAME" ] || die "--name goes with --ref. The short form is: $(basename "$0") <project> <env>"
+    [ ${#POS[@]} -eq 2 ] || { echo "Expected <project> <env>, or --ref <ref> --name <project> <env>." >&2; usage 1; }
+    NAME="${POS[0]}"
+    ENV="${POS[1]}"
+fi
+
+resolve_target
+resolve_backup_dir
 
 # ---------------------------------------------------------------- preflight --
 
@@ -107,16 +135,23 @@ check_project_access
 check_ref_binding "$ENV"
 link_project
 
-SNAP_ROOT="$BACKUPS_DIR/$NAME/$ENV"
+SNAP_ROOT="$BACKUP_DIR/$ENV"
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 DEST="$SNAP_ROOT/$STAMP"
 LATEST="$SNAP_ROOT/latest"
-PREV=$(readlink "$LATEST" 2>/dev/null || true)
-[ -n "$PREV" ] && PREV="$SNAP_ROOT/$(basename "$PREV")"
+PREV=$(latest_snapshot "$SNAP_ROOT" || true)
 
-WORK="$DEST.partial"
-rm -rf "$WORK"
-mkdir -p "$WORK"
+# Build the snapshot in a private local staging directory and move it into
+# SNAP_ROOT only once it is complete. Streaming dumps straight into a
+# cloud-synced folder (OneDrive or iCloud, which macOS runs through File
+# Provider) can fail mid-write with "Operation timed out" while the sync client
+# is busy. A finished directory moved in with one rename avoids that, and on the
+# same volume ($TMPDIR and ~/Library/CloudStorage both live on the data volume)
+# the move is instant.
+STAGE=$(mktemp -d "${TMPDIR:-/tmp}/supabase-snapshot.XXXXXX")
+KEEP_STAGE=0
+WORK="$STAGE/$STAMP"
+mkdir "$WORK"
 DL_LOG="$WORK/.download.log"
 # Only a completed run is allowed to leave a snapshot behind. Storage transfer
 # output is quiet unless something goes wrong, hence the log tail here.
@@ -125,7 +160,7 @@ cleanup() {
         echo "--- last lines of storage transfer log ---" >&2
         tail -20 "$DL_LOG" >&2
     fi
-    rm -rf "$WORK"
+    if [ "$KEEP_STAGE" = 0 ]; then rm -rf "$STAGE"; fi
     remove_link_dir
 }
 trap cleanup EXIT
@@ -300,15 +335,34 @@ gzip -9 "$WORK/roles.sql" "$WORK/schema.sql" "$WORK/data.sql"
     (cd "$WORK" && shasum -a 256 ./*.sql.gz manifest.json)
 } > "$WORK/MANIFEST.txt"
 
-mv "$WORK" "$DEST"
+# ----------------------------------------------------------------- move in --
+
+# In as <stamp>.partial, then renamed: one rename on the same volume, a copy
+# and a rename on another. Nobody sees a half-written snapshot under its final
+# name, and if either step fails the complete snapshot is kept for you.
+echo "==> Moving the snapshot into $SNAP_ROOT"
+if ! { mkdir -p "$SNAP_ROOT" && mv "$WORK" "$DEST.partial"; }; then
+    rm -rf "$DEST.partial"
+    KEEP_STAGE=1
+    die "Could not move the finished snapshot into $SNAP_ROOT.
+It is complete and kept at $WORK. Move it in by hand once that folder works:
+  mv \"$WORK\" \"$DEST\""
+fi
+if ! mv "$DEST.partial" "$DEST"; then
+    die "The snapshot is complete but still named $DEST.partial. Rename it by hand:
+  mv \"$DEST.partial\" \"$DEST\""
+fi
+rm -rf "$STAGE"
 trap remove_link_dir EXIT
-ln -sfn "$STAMP" "$LATEST"
+# For people browsing the folder. The scripts find the newest snapshot by
+# listing instead (see latest_snapshot), since OneDrive does not keep symlinks.
+ln -sfn "$STAMP" "$LATEST" 2>/dev/null || echo "warning: could not update $LATEST" >&2
 
 # ---------------------------------------------------------------- retention --
 
 # Hard links mean pruning an old snapshot only frees the objects unique to it.
 # (macOS ships bash 3.2, so no mapfile here.)
-find "$SNAP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '2*' \
+find "$SNAP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*T[0-9]*Z' \
     | sort -r | tail -n "+$(( KEEP + 1 ))" \
     | while IFS= read -r old; do
         echo "==> Pruning $(basename "$old")"
@@ -318,4 +372,4 @@ find "$SNAP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '2*' \
 echo
 echo "Done: $DEST"
 du -sh "$DEST" | awk '{print "Snapshot size: " $1}'
-echo "Total for $NAME/$ENV: $(du -sh "$SNAP_ROOT" | awk '{print $1}') across $(find "$SNAP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '2*' | wc -l | tr -d ' ') snapshots"
+echo "Total for $NAME/$ENV: $(du -sh "$SNAP_ROOT" | awk '{print $1}') across $(find "$SNAP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*T[0-9]*Z' | wc -l | tr -d ' ') snapshots"

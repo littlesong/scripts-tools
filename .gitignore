@@ -219,3 +219,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Supabase access tokens (format: supabase/tokens.example.ini)
+/supabase/tokens.ini
